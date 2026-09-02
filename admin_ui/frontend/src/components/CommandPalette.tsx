@@ -22,6 +22,7 @@ import {
     ArrowUpCircle,
     Phone,
     CalendarClock,
+    Building2,
     Search,
 } from 'lucide-react';
 
@@ -37,6 +38,7 @@ const pages: PageEntry[] = [
     { label: 'Dashboard', path: '/', icon: LayoutDashboard, group: 'Overview' },
     { label: 'Call History', path: '/history', icon: Phone, group: 'Overview', keywords: ['calls', 'phone'] },
     { label: 'Call Scheduling', path: '/scheduling', icon: CalendarClock, group: 'Overview', keywords: ['schedule', 'calendar'] },
+    { label: 'FS PBX Tenants', path: '/fspbx-tenants', icon: Building2, group: 'Overview', keywords: ['fspbx', 'tenant', 'domain', 'centralita'] },
     { label: 'Setup Wizard', path: '/wizard', icon: Zap, group: 'Overview', keywords: ['setup', 'onboard'] },
     { label: 'Providers', path: '/providers', icon: Server, group: 'Core Configuration', keywords: ['api', 'openai', 'google'] },
     { label: 'Pipelines', path: '/pipelines', icon: Workflow, group: 'Core Configuration', keywords: ['flow'] },
