@@ -8,17 +8,17 @@ Motostore / Centralita deploys Asterisk and AVA on the **same** host. Do **not**
 ; /etc/asterisk/extensions.conf  (or #include "extensions_ava.conf")
 [ava-motostore]
 exten => 7101,1,NoOp(Recepcionista Motostore)
- same => n,Set(AI_AGENT=recepcionista-motostore)
+ same => n,Set(AI_AGENT=recepcionista_motostore)
  same => n,Stasis(asterisk-ai-voice-agent)
  same => n,Hangup()
 
 exten => 7102,1,NoOp(Ventas Motostore)
- same => n,Set(AI_AGENT=ventas-motostore)
+ same => n,Set(AI_AGENT=ventas_motostore)
  same => n,Stasis(asterisk-ai-voice-agent)
  same => n,Hangup()
 
 exten => 7103,1,NoOp(Postventa Motostore)
- same => n,Set(AI_AGENT=postventa-motostore)
+ same => n,Set(AI_AGENT=postventa_motostore)
  same => n,Stasis(asterisk-ai-voice-agent)
  same => n,Hangup()
 
