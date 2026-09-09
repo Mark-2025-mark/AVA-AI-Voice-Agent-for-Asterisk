@@ -546,20 +546,32 @@ def stats(slug: str):
     return {"calls_30d": calls, "last_call": last}
 
 @router.get("/agents/{slug}/dialplan", response_model=DialplanResponse)
-def dialplan(slug: str):
+def dialplan(slug: str, context: str | None = None):
+    """Return a dialplan snippet for bare Asterisk + AVA (same host).
+
+    Default context is ``ava-motostore`` (Motostore / multi-agent). Pass
+    ``?context=from-ai-agent`` for the classic single-tenant context.
+    FreePBX ``from-internal-custom`` is no longer the default.
+    """
     row = _store().get_by_slug(slug)
     if not row:
         raise HTTPException(404)
     ext = row["extension"] or "XXXX"
     safe_name = (row['display_name'] or "").replace('\n', ' ').replace('\r', '')
+    ctx = (context or "").strip() or "ava-motostore"
+    # Guard against dialplan-breaking characters in context name.
+    if not all(ch.isalnum() or ch in "-_" for ch in ctx):
+        raise HTTPException(422, detail="Invalid dialplan context name")
     text = (
-        f"; AVA agent: {safe_name} — paste into extensions_custom.conf\n"
-        f"[from-internal-custom]\n"
+        f"; AVA agent: {safe_name} — Asterisk + AVA (same server; not FreePBX)\n"
+        f"; Paste into extensions.conf (or #include) then: asterisk -rx 'dialplan reload'\n"
+        f"[{ctx}]\n"
         f"exten => {ext},1,NoOp(AVA agent {slug})\n"
         f" same => n,Set(AI_AGENT={slug})\n"
         f" same => n,Stasis({STASIS_APP})\n"
         f" same => n,Hangup()\n"
-        f"; AI_CONTEXT={slug} is a deprecated compatibility alias; use AI_AGENT\n")
+        f"; Inbound DID example: Goto({ctx},{ext},1)\n"
+        f"; AI_CONTEXT={slug} is deprecated; use AI_AGENT\n")
     return {"dialplan": text, "extension": ext, "stasis_app": STASIS_APP}
 
 @router.get("/agents-migration/status")
