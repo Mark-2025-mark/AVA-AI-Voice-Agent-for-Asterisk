@@ -59,6 +59,137 @@ def test_get_config_redacts_hand_written_websocket_secret(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_config_validation_rejects_non_finite_provider_numbers(value):
+    parsed = yaml.safe_load(Path(config.settings.CONFIG_PATH).read_text())
+    parsed["providers"]["google_live"]["input_gain_max_db"] = value
+
+    with pytest.raises(HTTPException) as exc_info:
+        config._validate_ai_agent_config(yaml.safe_dump(parsed, sort_keys=False))
+
+    assert exc_info.value.status_code == 400
+    assert "providers.google_live.input_gain_max_db" in str(exc_info.value.detail)
+
+
+def test_get_config_reports_existing_non_finite_value_with_recovery_path(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "_read_merged_config_dict",
+        lambda: {"providers": {"google_live": {"input_gain_max_db": float("nan")}}},
+    )
+
+    app = FastAPI()
+    app.include_router(config.router, prefix="/api/config")
+    response = TestClient(app, raise_server_exceptions=False).get("/api/config")
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "providers.google_live.input_gain_max_db" in detail
+    assert "Advanced > Raw YAML" in detail
+
+
+def test_non_finite_config_path_quotes_dotted_provider_names():
+    with pytest.raises(HTTPException) as exc_info:
+        config._assert_finite_config_numbers(
+            {"providers": {"acme.google": {"input_gain_max_db": float("nan")}}}
+        )
+
+    assert 'providers["acme.google"].input_gain_max_db' in str(exc_info.value.detail)
+
+
+def test_config_update_rejects_recursive_yaml_alias_before_write(monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "_write_local_config",
+        lambda _content: pytest.fail("recursive config must not be written"),
+    )
+    app = FastAPI()
+    app.include_router(config.router, prefix="/api/config")
+
+    response = TestClient(app).post(
+        "/api/config/yaml",
+        json={"content": "loop: &loop [*loop]\n"},
+    )
+
+    assert response.status_code == 400
+    assert "recursive YAML alias" in response.json()["detail"]
+
+
+def test_finite_number_validation_rejects_recursive_loaded_config():
+    loop = []
+    loop.append(loop)
+
+    with pytest.raises(HTTPException) as exc_info:
+        config._assert_finite_config_numbers({"loop": loop}, status_code=422)
+
+    assert exc_info.value.status_code == 422
+    assert "recursive YAML alias at loop[0]" in str(exc_info.value.detail)
+
+
+def test_config_validation_allows_non_recursive_yaml_aliases():
+    parsed = config._safe_load_no_duplicates(
+        "first: &shared [1, 2]\nsecond: *shared\n"
+    )
+
+    config._assert_finite_config_numbers(parsed)
+    assert parsed == {"first": [1, 2], "second": [1, 2]}
+
+
+def test_get_config_reports_recursive_local_override(monkeypatch, tmp_path):
+    base_path = tmp_path / "ai-agent.yaml"
+    local_path = tmp_path / "ai-agent.local.yaml"
+    base_path.write_text("providers:\n  local:\n    type: local\n")
+    local_path.write_text("loop: &loop [*loop]\n")
+    monkeypatch.setattr(config.settings, "CONFIG_PATH", str(base_path))
+    monkeypatch.setattr(config.settings, "LOCAL_CONFIG_PATH", str(local_path))
+
+    app = FastAPI()
+    app.include_router(config.router, prefix="/api/config")
+    response = TestClient(app, raise_server_exceptions=False).get("/api/config")
+
+    assert response.status_code == 422
+    assert "recursive YAML alias" in response.json()["detail"]
+    assert "local configuration file" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("key", [".nan", ".inf", "-.inf"])
+def test_get_config_reports_non_finite_local_override_key(monkeypatch, tmp_path, key):
+    base_path = tmp_path / "ai-agent.yaml"
+    local_path = tmp_path / "ai-agent.local.yaml"
+    base_path.write_text("providers:\n  local:\n    type: local\n")
+    local_path.write_text(f"{key}: malformed\n")
+    monkeypatch.setattr(config.settings, "CONFIG_PATH", str(base_path))
+    monkeypatch.setattr(config.settings, "LOCAL_CONFIG_PATH", str(local_path))
+
+    app = FastAPI()
+    app.include_router(config.router, prefix="/api/config")
+    response = TestClient(app, raise_server_exceptions=False).get("/api/config")
+
+    assert response.status_code == 422
+    assert "non-finite numeric mapping key" in response.json()["detail"]
+    assert "local configuration file" in response.json()["detail"]
+
+
+def test_config_update_rejects_non_finite_value_before_write(monkeypatch):
+    parsed = yaml.safe_load(Path(config.settings.CONFIG_PATH).read_text())
+    parsed["providers"]["google_live"]["input_gain_max_db"] = float("nan")
+    monkeypatch.setattr(
+        config,
+        "_write_local_config",
+        lambda _content: pytest.fail("invalid config must not be written"),
+    )
+
+    app = FastAPI()
+    app.include_router(config.router, prefix="/api/config")
+    response = TestClient(app).post(
+        "/api/config/yaml",
+        json={"content": yaml.safe_dump(parsed, sort_keys=False)},
+    )
+
+    assert response.status_code == 400
+    assert "providers.google_live.input_gain_max_db" in response.json()["detail"]
+
+
 def test_health_api_token_impacts_local_ai_when_used_as_live_status_fallback():
     assert config._local_ai_env_key("HEALTH_API_TOKEN") is True
 

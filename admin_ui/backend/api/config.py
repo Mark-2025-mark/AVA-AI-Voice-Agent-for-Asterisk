@@ -13,6 +13,8 @@ import tempfile
 import sys
 import threading
 import logging
+import math
+import json
 import ssl
 import smtplib
 from copy import deepcopy
@@ -272,34 +274,71 @@ def _admin_ui_env_key(key: str) -> bool:
     )
 
 
-def _assert_no_duplicate_yaml_keys(node: yaml.Node) -> None:
+class _RecursiveYamlAliasError(ConstructorError):
+    """Raised when YAML aliases create a cycle in the configuration graph."""
+
+
+class _NonFiniteYamlKeyError(ConstructorError):
+    """Raised when a YAML mapping uses a non-JSON-compatible numeric key."""
+
+
+def _assert_no_duplicate_yaml_keys(
+    node: yaml.Node,
+    visiting: Optional[set[int]] = None,
+) -> None:
     """
     Detect duplicate mapping keys before calling yaml.safe_load().
 
     We avoid yaml.load() here to keep CodeQL happy while still enforcing our
     "no duplicate keys" constraint for Admin UI config edits.
     """
-    if isinstance(node, MappingNode):
-        seen: dict[str, ScalarNode] = {}
-        for key_node, value_node in node.value:
-            # Config files use string keys; if not, fall back to a stable repr.
-            if isinstance(key_node, ScalarNode):
-                key = str(key_node.value)
-            else:
-                key = str(key_node)
-            if key in seen:
-                raise ConstructorError(
-                    "while constructing a mapping",
-                    node.start_mark,
-                    f"found duplicate key ({key!r})",
-                    key_node.start_mark,
-                )
-            if isinstance(key_node, ScalarNode):
-                seen[key] = key_node
-            _assert_no_duplicate_yaml_keys(value_node)
-    elif isinstance(node, SequenceNode):
-        for item in node.value:
-            _assert_no_duplicate_yaml_keys(item)
+    if not isinstance(node, (MappingNode, SequenceNode)):
+        return
+
+    active = visiting if visiting is not None else set()
+    node_id = id(node)
+    if node_id in active:
+        raise _RecursiveYamlAliasError(
+            "while constructing the configuration",
+            node.start_mark,
+            "found recursive YAML alias",
+            node.start_mark,
+        )
+
+    active.add(node_id)
+    try:
+        if isinstance(node, MappingNode):
+            seen: dict[str, ScalarNode] = {}
+            for key_node, value_node in node.value:
+                # Config files use string keys; if not, fall back to a stable repr.
+                if isinstance(key_node, ScalarNode):
+                    if key_node.tag == "tag:yaml.org,2002:float":
+                        parsed_key = yaml.safe_load(key_node.value)
+                        if isinstance(parsed_key, float) and not math.isfinite(parsed_key):
+                            raise _NonFiniteYamlKeyError(
+                                "while constructing a mapping",
+                                node.start_mark,
+                                f"found non-finite numeric key ({key_node.value!r})",
+                                key_node.start_mark,
+                            )
+                    key = str(key_node.value)
+                else:
+                    key = str(key_node)
+                if key in seen:
+                    raise ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate key ({key!r})",
+                        key_node.start_mark,
+                    )
+                if isinstance(key_node, ScalarNode):
+                    seen[key] = key_node
+                _assert_no_duplicate_yaml_keys(value_node, active)
+        else:
+            for item in node.value:
+                _assert_no_duplicate_yaml_keys(item, active)
+    finally:
+        active.remove(node_id)
 
 
 def _safe_load_no_duplicates(content: str):
@@ -307,6 +346,75 @@ def _safe_load_no_duplicates(content: str):
     if node is not None:
         _assert_no_duplicate_yaml_keys(node)
     return yaml.safe_load(content)
+
+
+class _RecursiveConfigAliasError(ValueError):
+    """Raised when an in-memory configuration contains a recursive container."""
+
+    def __init__(self, path: str):
+        self.path = path or "<root>"
+        super().__init__(self.path)
+
+
+def _non_finite_number_paths(
+    value: Any,
+    path: str = "",
+    visiting: Optional[set[int]] = None,
+) -> list[str]:
+    """Return config paths containing floats that cannot be represented in JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return [path or "<root>"]
+
+    if not isinstance(value, (dict, list)):
+        return []
+
+    active = visiting if visiting is not None else set()
+    value_id = id(value)
+    if value_id in active:
+        raise _RecursiveConfigAliasError(path)
+
+    active.add(value_id)
+    paths: list[str] = []
+    try:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key)
+                if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", key_text):
+                    child_path = f"{path}.{key_text}" if path else key_text
+                else:
+                    child_path = f"{path}[{json.dumps(key_text)}]"
+                paths.extend(_non_finite_number_paths(child, child_path, active))
+        else:
+            for index, child in enumerate(value):
+                paths.extend(_non_finite_number_paths(child, f"{path}[{index}]", active))
+        return paths
+    finally:
+        active.remove(value_id)
+
+
+def _assert_finite_config_numbers(value: Any, *, status_code: int = 400) -> None:
+    try:
+        paths = _non_finite_number_paths(value)
+    except _RecursiveConfigAliasError as exc:
+        raise HTTPException(
+            status_code=status_code,
+            detail=(
+                "Configuration contains a recursive YAML alias at "
+                f"{exc.path}. Replace the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    if not paths:
+        return
+    displayed = ", ".join(paths[:10])
+    if len(paths) > 10:
+        displayed += f", and {len(paths) - 10} more"
+    raise HTTPException(
+        status_code=status_code,
+        detail=(
+            "Configuration contains non-finite numeric values that are not JSON-compatible: "
+            f"{displayed}. Replace .nan/.inf values in Advanced > Raw YAML with finite numbers."
+        ),
+    )
 
 
 def _deep_merge_dicts(base: dict, override: dict) -> dict:
@@ -394,6 +502,8 @@ def _read_merged_config_dict() -> dict:
     try:
         with open(settings.LOCAL_CONFIG_PATH, "r") as f:
             local = _safe_load_no_duplicates(f.read()) or {}
+    except (_RecursiveYamlAliasError, _NonFiniteYamlKeyError):
+        raise
     except Exception:
         return base
 
@@ -776,6 +886,11 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
 
     if not isinstance(parsed, dict):
         raise HTTPException(status_code=400, detail="Invalid YAML: expected a mapping at the document root")
+
+    # YAML permits .nan/.inf, but JSON and downstream numeric operations do not.
+    # Reject these values before validation or persistence so a form edit cannot
+    # poison the structured config endpoint or runtime behavior.
+    _assert_finite_config_numbers(parsed)
 
     # Ensure project root is importable so we can reuse canonical Pydantic models.
     project_root = getattr(settings, "PROJECT_ROOT", None)
@@ -1199,7 +1314,28 @@ async def reset_pipeline_audio(pipeline_name: str):
 @router.get("")
 @router.get("/")
 async def get_config():
-    return _redact_websocket_media_secrets(_read_merged_config_dict())
+    try:
+        safe = _redact_websocket_media_secrets(_read_merged_config_dict())
+    except _RecursiveYamlAliasError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a recursive YAML alias. Repair the local "
+                "configuration file by replacing the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    except _NonFiniteYamlKeyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a non-finite numeric mapping key. Repair the local "
+                "configuration file by replacing .nan/.inf keys with ordinary text keys."
+            ),
+        ) from exc
+    # Existing operator overrides may predate write-time validation. Return a
+    # controlled, actionable response while leaving /yaml available for repair.
+    _assert_finite_config_numbers(safe, status_code=422)
+    return safe
 
 
 def _redact_websocket_media_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
