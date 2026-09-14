@@ -101,6 +101,7 @@ from .core.vad_manager import EnhancedVADManager, VADResult
 from .core.streaming_playback_manager import StreamingPlaybackManager
 from .core.transport_orchestrator import TransportOrchestrator, TransportProfile, apply_context_voice
 from .core.models import CallSession
+from .core.call_diagnostics import build_call_diagnostics_snapshot
 from .core.no_input_watchdog import NoInputPolicy, NoInputWatchdog
 from .core.outbound_schedule import normalize_outbound_daily_window
 from .core.outbound_store import get_outbound_store
@@ -6522,6 +6523,19 @@ class Engine:
                     provider=session.provider_name,
                     vad_mode=getattr(self, "_vad_mode", "auto"),
                 )
+            try:
+                # Preserve call-start configuration even when a later setup step
+                # fails before effective provider/profile resolution completes.
+                session.diagnostics_snapshot = build_call_diagnostics_snapshot(
+                    self.config,
+                    session,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to capture initial call diagnostics snapshot",
+                    call_id=caller_channel_id,
+                    exc_info=True,
+                )
             await self._save_session(session, new=True)
 
             # Read called_number: cache (from ChannelVarSet events) > GET request > "unknown"
@@ -6813,6 +6827,12 @@ class Engine:
             # RCA: emit a deterministic per-call header snapshot for log-driven `agent rca`.
             # This MUST be INFO-level so it is available even when debug logging is disabled.
             try:
+                session.diagnostics_snapshot = build_call_diagnostics_snapshot(
+                    self.config,
+                    session,
+                    replace_configured=True,
+                )
+                await self._save_session(session)
                 tp = getattr(session, "transport_profile", None)
                 tp_fmt = (
                     getattr(tp, "wire_encoding", None)
@@ -10636,6 +10656,7 @@ class Engine:
                 caller_audio_format=session.caller_audio_format,
                 codec_alignment_ok=session.codec_alignment_ok,
                 barge_in_count=barge_in_count,
+                diagnostics_snapshot=build_call_diagnostics_snapshot(getattr(self, "config", None), session),
                 external_platform=getattr(session, 'external_platform', None),
                 external_call_id=getattr(session, 'external_call_id', None),
                 external_direction=getattr(session, 'external_direction', None),
