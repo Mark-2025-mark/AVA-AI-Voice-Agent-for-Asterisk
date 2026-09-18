@@ -172,6 +172,23 @@ class SessionStore:
         async with self._lock:
             return self._sessions_by_channel_id.get(channel_id)
 
+    async def drop_channel_aliases(
+        self, session: CallSession, channel_ids: List[str]
+    ) -> None:
+        """Remove non-caller channel aliases so aux ChannelDestroyed cannot reclaim the call."""
+        async with self._lock:
+            if self._sessions_by_call_id.get(session.call_id) is not session:
+                return
+            for channel_id in channel_ids:
+                cid = str(channel_id or "").strip()
+                if not cid or cid == session.caller_channel_id or cid == session.call_id:
+                    continue
+                mapped = self._sessions_by_channel_id.get(cid)
+                if mapped is session or (
+                    mapped is not None and mapped.call_id == session.call_id
+                ):
+                    self._sessions_by_channel_id.pop(cid, None)
+
     async def has_active_sessions_for_provider(self, provider_key: str) -> bool:
         """Return whether any active call is currently using provider_key."""
         async with self._lock:

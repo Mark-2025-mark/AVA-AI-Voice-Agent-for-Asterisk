@@ -205,6 +205,14 @@ class CallSession:
     current_action: Optional[Dict[str, Any]] = None      # Currently executing action
     transfer_context: Optional[Dict[str, Any]] = None    # Context to pass to transfer target
     pending_deferred_transfer: Optional[Dict[str, Any]] = None  # Transfer action waiting for TTS/audio completion
+    # Dialplan continue ownership. transfer_active keeps cleanup from hanging up a
+    # successfully handed-off caller. agent_handoff_* cover AVA→AVA Stasis re-entry
+    # on the same channel_id (e.g. 7101 recepcionista → 7102 ventas).
+    transfer_active: bool = False
+    transfer_state: Optional[str] = None
+    transfer_target: Optional[str] = None
+    agent_handoff_pending: bool = False
+    agent_handoff_in_progress: bool = False
     
     # Call history tracking (Milestone 21)
     # Append-only terminal in-call tool-result stream. v7.5.3 adds call_id,

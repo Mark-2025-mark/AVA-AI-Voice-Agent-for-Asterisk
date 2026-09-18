@@ -31,6 +31,35 @@ Then: `asterisk -rx 'dialplan reload'`
 
 `GET /api/agents/{slug}/dialplan?context=ava-motostore` returns the stanza for that agent’s extension.
 
-## Transfers
+## Transfers (agent → agent)
 
-ERP Sync writes `tools.transfer.destinations` with `dialplan_context=ava-motostore` so receptionist `blind_transfer` dials `Local/7102@ava-motostore` (etc.).
+ERP Sync writes `tools.transfer.destinations` with `type: extension`, `target: 7102|7103`, and
+`dialplan_context` matching the context above (`ava-motostore` or `from-fspbx`).
+
+`blind_transfer` uses ARI `continue_in_dialplan` (not SIP originate). The same Asterisk
+`channel_id` leaves Stasis, runs `Set(AI_AGENT=…)` on the destination extension, and
+re-enters Stasis. AVA keeps the `CallSession`, stops the previous provider, rebinds
+tools/prompt to the new Agent slug, and starts a new provider session.
+
+You do **not** need PJSIP endpoints for 7101/7102/7103 for this path. Those dialplan
+extensions are enough.
+
+## Deploy / update this fork on Debian
+
+From the AVA install directory (compose project `asterisk-ai-voice-agent`):
+
+```bash
+# Prefer the maintained updater when pointing at your fork/ref:
+agent update --ref <branch-or-tag> --include-ui --local-changes=retain
+
+# Or pull the fork branch and recreate engine + UI:
+git fetch origin
+git checkout <branch>
+git pull --ff-only
+docker compose -p asterisk-ai-voice-agent up -d --build --force-recreate ai_engine admin_ui
+agent check
+```
+
+After deploy, place a test call: recepcionista → “pásame con ventas” → confirm ventas
+greets (logs should show `Agent handoff re-entry` / `Agent handoff rebound`, not
+`Caller already in progress` alone).
