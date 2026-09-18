@@ -34,3 +34,20 @@ Then: `asterisk -rx 'dialplan reload'`
 ## Transfers
 
 ERP Sync writes `tools.transfer.destinations` with `dialplan_context=ava-motostore` so receptionist `blind_transfer` dials `Local/7102@ava-motostore` (etc.).
+
+### Symptom: tool says ok, call never reaches ventas
+
+Call History may show `blind_transfer` **success** in a few ms (“Transferring you to Ventas Motostore…”) while `transfer_occurred` is false / the caller never hears ventas.
+
+That is **not** an ERP `erp_customer_lookup` failure. AVA arms a deferred transfer, then ARI `continue`s into the destination dialplan. If `7102@ava-motostore` (or the configured context) is missing, Asterisk can accept `continue` and immediately hang up — the receptionist call ends as `transferred` without a live ventas agent.
+
+Verify on the AVA/Asterisk host:
+
+```bash
+asterisk -rx 'dialplan show 7102@ava-motostore'
+asterisk -rx 'dialplan show 7103@ava-motostore'
+```
+
+Both must show `Set(AI_AGENT=…)` + `Stasis(asterisk-ai-voice-agent)`. In AVA → Tools → Transfer, confirm each Motostore destination has `dialplan_context=ava-motostore` (not FreePBX `from-internal`).
+
+For a useful support ZIP next time, set logging to JSON/INFO so `logs/ai_engine.log` is not empty.
