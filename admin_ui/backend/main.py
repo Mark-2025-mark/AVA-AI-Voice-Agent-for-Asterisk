@@ -114,7 +114,7 @@ if _is_remote_bind and _raw_jwt_secret in _placeholder_secrets:
         _uvicorn_host,
     )
 
-from api import config, system, live_status, wizard, logs, local_ai, ollama, mcp, calls, outbound, vicidial, tools, docs, custom_models, agents, support  # noqa: E402
+from api import config, system, live_status, wizard, logs, local_ai, ollama, mcp, calls, outbound, vicidial, fspbx, tools, docs, custom_models, agents, support  # noqa: E402
 import auth  # noqa: E402
 from agents_store import AgentsStore  # noqa: E402
 
@@ -165,6 +165,7 @@ Most endpoints require JWT authentication. Obtain a token via `POST /api/auth/lo
         {"name": "agents", "description": "Agents (v7) — CRUD, per-agent stats, dialplan snippets, templates, and YAML→DB migration status"},
         {"name": "calls", "description": "Call history and analytics"},
         {"name": "outbound", "description": "Outbound campaigns and lead management"},
+        {"name": "fspbx", "description": "FS PBX tenant to AVA agent assignments"},
         {"name": "tools", "description": "Tool catalog, HTTP tool testing, and managed HTTP/webhook tool CRUD"},
         {"name": "logs", "description": "Container logs and events"},
         {"name": "mcp", "description": "MCP server status (proxied from AI Engine)"},
@@ -262,6 +263,7 @@ app.include_router(ollama.router, tags=["ollama"], dependencies=[Depends(auth.ge
 app.include_router(calls.router, prefix="/api", tags=["calls"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(outbound.router, prefix="/api", tags=["outbound"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(vicidial.router, prefix="/api", tags=["outbound"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(fspbx.router, prefix="/api", tags=["fspbx"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(tools.router, prefix="/api/tools", tags=["tools"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(docs.router, tags=["documentation"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(custom_models.router, prefix="/api/custom-models", tags=["custom-models"], dependencies=[Depends(auth.get_current_user)])

@@ -22,6 +22,7 @@ import LegacyContextsRedirect from './pages/LegacyContextsRedirect';
 import ProfilesPage from './pages/ProfilesPage';
 import ToolsPage from './pages/ToolsPage';
 import MCPPage from './pages/MCPPage';
+import FspbxTenantsPage from './pages/FspbxTenantsPage';
 
 // Advanced Configuration Pages
 import VADPage from './pages/Advanced/VADPage';
@@ -181,6 +182,7 @@ function App() {
                                             <Route path="/" element={<Dashboard />} />
                                             <Route path="/history" element={<CallHistoryPage />} />
                                             <Route path="/scheduling" element={<CallSchedulingPage />} />
+                                            <Route path="/fspbx-tenants" element={<FspbxTenantsPage />} />
 
                                             {/* Core Configuration */}
                                             <Route path="/providers" element={<ProvidersPage />} />

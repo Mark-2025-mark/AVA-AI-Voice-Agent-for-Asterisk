@@ -24,6 +24,7 @@ import {
     Heart,
     HardDrive,
     ArrowUpCircle,
+    Building2,
     Phone,
     CalendarClock,
     LogOut,
@@ -147,6 +148,7 @@ const Sidebar = () => {
                         <SidebarItem to="/" icon={LayoutDashboard} label="Dashboard" end />
                         <SidebarItem to="/history" icon={Phone} label="Call History" />
                         <SidebarItem to="/scheduling" icon={CalendarClock} label="Call Scheduling" />
+                        <SidebarItem to="/fspbx-tenants" icon={Building2} label="FS PBX Tenants" />
                         <SidebarItem to="/wizard" icon={Zap} label="Setup Wizard" />
                     </SidebarGroup>
 
