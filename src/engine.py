@@ -471,6 +471,9 @@ class Engine:
         self._transfer_stasis_hop_timeout_sec: float = float(
             os.getenv("AAVA_TRANSFER_STASIS_HOP_TIMEOUT_SEC", "5") or "5"
         )
+        # Serialize StasisEnd hop suspend vs StasisStart agent handoff so a late
+        # hop suspend cannot destroy the bridge/media the handoff just created.
+        self._transfer_hop_locks: Dict[str, asyncio.Lock] = {}
         self._outbound_attempt_amd: Dict[str, Dict[str, Optional[str]]] = {}
         # Throttle per-campaign scheduler error logs (avoid flooding when DB perms are wrong).
         self._outbound_last_campaign_error_log_ts: Dict[str, float] = {}
@@ -1404,6 +1407,22 @@ class Engine:
             or getattr(session, "transfer_active", False)
         )
 
+    def _transfer_hop_lock_for(self, call_id: str) -> asyncio.Lock:
+        locks = getattr(self, "_transfer_hop_locks", None)
+        if not isinstance(locks, dict):
+            locks = {}
+            self._transfer_hop_locks = locks
+        lock = locks.get(call_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[call_id] = lock
+        return lock
+
+    def _release_transfer_hop_lock(self, call_id: str) -> None:
+        locks = getattr(self, "_transfer_hop_locks", None)
+        if isinstance(locks, dict):
+            locks.pop(call_id, None)
+
     def _cancel_transfer_stasis_hop_timer(self, call_id: str) -> None:
         tasks = getattr(self, "_transfer_stasis_hop_tasks", None)
         if not isinstance(tasks, dict):
@@ -1454,9 +1473,57 @@ class Engine:
         )
         self._transfer_stasis_hop_tasks[call_id] = task
 
-    async def _suspend_call_resources_for_stasis_hop(self, session: CallSession) -> None:
-        """Stop provider/media for a dialplan hop while retaining the CallSession."""
+    async def _suspend_call_resources_for_stasis_hop(
+        self,
+        session: CallSession,
+        *,
+        ownership_token: Optional[str] = None,
+    ) -> None:
+        """Stop provider/media for a dialplan hop while retaining the CallSession.
+
+        ``ownership_token`` snapshots the bridge/media identity at call time. After any
+        await, destructive steps run only if the session still owns that same identity
+        so a concurrent agent handoff cannot have its new bridge torn down.
+        """
         call_id = session.call_id
+        bridge_id = getattr(session, "bridge_id", None)
+        action_channels: List[str] = []
+        try:
+            action = getattr(session, "current_action", None) or {}
+            if isinstance(action, dict):
+                for key in ("agent_channel_id", "channel_id", "predial_channel_id"):
+                    value = action.get(key)
+                    if value:
+                        action_channels.append(str(value))
+        except Exception:
+            action_channels = []
+        media_channels = list(
+            dict.fromkeys(
+                filter(
+                    None,
+                    [
+                        session.local_channel_id,
+                        session.external_media_id,
+                        session.audiosocket_channel_id,
+                        session.media_channel_id,
+                        *action_channels,
+                    ],
+                )
+            )
+        )
+        token = ownership_token or f"{bridge_id}|{'|'.join(media_channels)}"
+
+        def _still_owns_snapshot() -> bool:
+            if getattr(session, "agent_handoff_in_progress", False) and ownership_token:
+                # Handoff claimed the call after this suspend started; do not touch
+                # resources the handoff may already have replaced.
+                current = (
+                    f"{getattr(session, 'bridge_id', None)}|"
+                    f"{'|'.join(filter(None, [session.local_channel_id, session.external_media_id, session.audiosocket_channel_id, session.media_channel_id]))}"
+                )
+                return current == token
+            return True
+
         try:
             start_task = self._provider_start_tasks.pop(call_id, None)
             if start_task:
@@ -1475,6 +1542,12 @@ class Engine:
                 call_id=call_id,
                 exc_info=True,
             )
+        if not _still_owns_snapshot():
+            logger.info(
+                "Skipping remaining hop suspend; agent handoff owns the session",
+                call_id=call_id,
+            )
+            return
         session.provider_session_active = False
 
         try:
@@ -1486,8 +1559,14 @@ class Engine:
                 exc_info=True,
             )
 
-        bridge_id = getattr(session, "bridge_id", None)
-        if bridge_id:
+        if not _still_owns_snapshot():
+            logger.info(
+                "Skipping hop bridge teardown; agent handoff owns the session",
+                call_id=call_id,
+            )
+            return
+
+        if bridge_id and getattr(session, "bridge_id", None) == bridge_id:
             try:
                 await self.ari_client.destroy_bridge(bridge_id)
             except Exception:
@@ -1497,34 +1576,12 @@ class Engine:
                     bridge_id=bridge_id,
                     exc_info=True,
                 )
-            session.bridge_id = None
-            self.bridges.pop(session.caller_channel_id, None)
+            if getattr(session, "bridge_id", None) == bridge_id:
+                session.bridge_id = None
+                self.bridges.pop(session.caller_channel_id, None)
 
-        action_channels: List[str] = []
-        try:
-            action = getattr(session, "current_action", None) or {}
-            if isinstance(action, dict):
-                for key in ("agent_channel_id", "channel_id", "predial_channel_id"):
-                    value = action.get(key)
-                    if value:
-                        action_channels.append(str(value))
-        except Exception:
-            action_channels = []
-
-        media_channels = list(
-            dict.fromkeys(
-                filter(
-                    None,
-                    [
-                        session.local_channel_id,
-                        session.external_media_id,
-                        session.audiosocket_channel_id,
-                        session.media_channel_id,
-                        *action_channels,
-                    ],
-                )
-            )
-        )
+        if not _still_owns_snapshot():
+            return
 
         # Drop aliases before hangup so aux ChannelDestroyed cannot start full cleanup.
         try:
@@ -1537,6 +1594,8 @@ class Engine:
             )
 
         for channel_id in media_channels:
+            if not _still_owns_snapshot():
+                break
             try:
                 # Aux teardown must not reclaim the caller session mid-hop.
                 seen_aux = getattr(self, "_seen_aux_channels", None)
@@ -1551,12 +1610,20 @@ class Engine:
                     exc_info=True,
                 )
 
-        session.local_channel_id = None
-        session.external_media_id = None
-        session.audiosocket_channel_id = None
-        session.audiosocket_conn_id = None
-        session.audiosocket_uuid = None
-        session.media_channel_id = None
+        if not _still_owns_snapshot():
+            return
+
+        # Only clear fields that still match the snapshot we tore down.
+        if session.local_channel_id in media_channels:
+            session.local_channel_id = None
+        if session.external_media_id in media_channels:
+            session.external_media_id = None
+        if session.audiosocket_channel_id in media_channels:
+            session.audiosocket_channel_id = None
+            session.audiosocket_conn_id = None
+            session.audiosocket_uuid = None
+        if session.media_channel_id in media_channels:
+            session.media_channel_id = None
         session.pending_local_channel_id = None
         session.pending_external_media_id = None
         session.media_rx_confirmed = False
@@ -1590,19 +1657,45 @@ class Engine:
     ) -> None:
         """StasisEnd during dialplan transfer: keep session alive for possible agent re-entry."""
         call_id = session.call_id
-        session.agent_handoff_pending = True
-        session.cleanup_in_progress = False
-        session.cleanup_completed = False
-        await self._save_session(session)
-        logger.info(
-            "Transfer Stasis hop — suspending AI resources; awaiting possible re-entry",
-            call_id=call_id,
-            channel_id=channel_id,
-            transfer_target=getattr(session, "transfer_target", None),
-            previous_agent=getattr(session, "context_name", None),
-        )
-        await self._suspend_call_resources_for_stasis_hop(session)
-        self._schedule_transfer_stasis_hop_cleanup(call_id)
+        async with self._transfer_hop_lock_for(call_id):
+            # StasisStart handoff may have won the race while we waited for the lock.
+            if getattr(session, "agent_handoff_in_progress", False):
+                logger.info(
+                    "Skipping transfer Stasis hop suspend; agent handoff already in progress",
+                    call_id=call_id,
+                    channel_id=channel_id,
+                )
+                return
+            if not getattr(session, "transfer_active", False) and not getattr(
+                session, "agent_handoff_pending", False
+            ):
+                return
+
+            session.agent_handoff_pending = True
+            session.cleanup_in_progress = False
+            session.cleanup_completed = False
+            await self._save_session(session)
+            logger.info(
+                "Transfer Stasis hop — suspending AI resources; awaiting possible re-entry",
+                call_id=call_id,
+                channel_id=channel_id,
+                transfer_target=getattr(session, "transfer_target", None),
+                previous_agent=getattr(session, "context_name", None),
+            )
+            ownership = (
+                f"{getattr(session, 'bridge_id', None)}|"
+                f"{'|'.join(filter(None, [session.local_channel_id, session.external_media_id, session.audiosocket_channel_id, session.media_channel_id]))}"
+            )
+            await self._suspend_call_resources_for_stasis_hop(
+                session, ownership_token=ownership
+            )
+            if getattr(session, "agent_handoff_in_progress", False):
+                logger.info(
+                    "Transfer Stasis hop aborted after suspend; handoff owns the call",
+                    call_id=call_id,
+                )
+                return
+            self._schedule_transfer_stasis_hop_cleanup(call_id)
 
     async def _handle_agent_handoff_reentry(
         self, session: CallSession, channel: dict
@@ -1610,156 +1703,137 @@ class Engine:
         """Rebind CallSession to the dialplan AI_AGENT after continue_in_dialplan re-entry."""
         caller_channel_id = session.call_id
         previous_agent = getattr(session, "context_name", None)
-        self._cancel_transfer_stasis_hop_timer(caller_channel_id)
+        async with self._transfer_hop_lock_for(caller_channel_id):
+            self._cancel_transfer_stasis_hop_timer(caller_channel_id)
 
-        session.agent_handoff_in_progress = True
-        session.agent_handoff_pending = True
-        session.cleanup_in_progress = False
-        session.cleanup_completed = False
-        await self._save_session(session)
-
-        # A raced full cleanup may have stamped these guards before handoff won.
-        try:
-            _cleanup_completed_at.pop(caller_channel_id, None)
-            _cleanup_in_progress.discard(caller_channel_id)
-        except Exception:
-            pass
-
-        logger.info(
-            "Agent handoff re-entry — rebinding session to dialplan AI_AGENT",
-            call_id=caller_channel_id,
-            previous_agent=previous_agent,
-            transfer_target=getattr(session, "transfer_target", None)
-            or getattr(session, "transfer_destination", None),
-        )
-
-        try:
-            await self._suspend_call_resources_for_stasis_hop(session)
-
-            # Retain caller identity and transfer audit; reset persona/runtime for the new agent.
-            if not getattr(session, "transfer_destination", None):
-                session.transfer_destination = (
-                    getattr(session, "transfer_target", None) or previous_agent
-                )
-            session.transfer_active = False
-            session.transfer_state = None
-            session.transfer_target = None
-            session.agent_handoff_pending = False
-            session.pending_deferred_transfer = None
-            session.current_action = None
-            session.pending_actions = []
-            session.provider_session_active = False
-            session.context_resolution_error = None
-            session.pipeline_resolution_error = None
-            session.error_message = None
-            session.call_outcome = ""
-            session.conversation_history = []
-            session.last_transcript = None
-            session.last_agent_response = None
-            session.pre_call_results = {}
-            session.pre_call_tool_calls = []
-            session.provider_overrides = {}
-            session.pipeline_name = None
-            session.pipeline_components = {}
-            session.conversation_state = "greeting"
-            session.status = "connected"
-            session.audio_capture_enabled = True
-            session.tts_playing = False
-            session.tts_tokens = set()
-            session.tts_active_count = 0
-            session.tool_runtime_generation = getattr(self, "_tool_generation", None)
-            self._resolve_session_tool_runtime(session)
-
-            bridge_id = await self.ari_client.create_bridge()
-            if not bridge_id:
-                raise RuntimeError("Failed to create mixing bridge for agent handoff")
-            caller_success = await self.ari_client.add_channel_to_bridge(
-                bridge_id, caller_channel_id
-            )
-            if not caller_success:
-                raise RuntimeError("Failed to add caller to bridge for agent handoff")
-            session.bridge_id = bridge_id
-            self.bridges[caller_channel_id] = bridge_id
+            session.agent_handoff_in_progress = True
+            session.agent_handoff_pending = True
+            session.cleanup_in_progress = False
+            session.cleanup_completed = False
             await self._save_session(session)
 
+            # A raced full cleanup may have stamped these guards before handoff won.
             try:
-                await self._hydrate_transport_from_dialplan(session, caller_channel_id)
+                _cleanup_completed_at.pop(caller_channel_id, None)
+                _cleanup_in_progress.discard(caller_channel_id)
             except Exception:
-                logger.debug(
-                    "Transport hydration failed during agent handoff",
-                    call_id=caller_channel_id,
-                    exc_info=True,
+                pass
+
+            logger.info(
+                "Agent handoff re-entry — rebinding session to dialplan AI_AGENT",
+                call_id=caller_channel_id,
+                previous_agent=previous_agent,
+                transfer_target=getattr(session, "transfer_target", None)
+                or getattr(session, "transfer_destination", None),
+            )
+
+            try:
+                ownership = (
+                    f"{getattr(session, 'bridge_id', None)}|"
+                    f"{'|'.join(filter(None, [session.local_channel_id, session.external_media_id, session.audiosocket_channel_id, session.media_channel_id]))}"
                 )
-            try:
-                await self._detect_caller_codec(session, caller_channel_id)
-            except Exception:
-                logger.debug(
-                    "Caller codec detection failed during agent handoff",
-                    call_id=caller_channel_id,
-                    exc_info=True,
+                await self._suspend_call_resources_for_stasis_hop(
+                    session, ownership_token=ownership
                 )
 
-            await self._resolve_audio_profile(session, caller_channel_id)
-            if getattr(session, "context_resolution_error", None):
-                session.agent_handoff_in_progress = False
+                # Retain caller identity and transfer audit; reset persona/runtime for the new agent.
+                if not getattr(session, "transfer_destination", None):
+                    session.transfer_destination = (
+                        getattr(session, "transfer_target", None) or previous_agent
+                    )
+                session.transfer_active = False
+                session.transfer_state = None
+                session.transfer_target = None
+                session.agent_handoff_pending = False
+                session.pending_deferred_transfer = None
+                session.current_action = None
+                session.pending_actions = []
+                session.provider_session_active = False
+                session.context_resolution_error = None
+                session.pipeline_resolution_error = None
+                session.error_message = None
+                session.call_outcome = ""
+                session.conversation_history = []
+                session.last_transcript = None
+                session.last_agent_response = None
+                session.pre_call_results = {}
+                session.pre_call_tool_calls = []
+                session.provider_overrides = {}
+                session.pipeline_name = None
+                session.pipeline_components = {}
+                session.conversation_state = "greeting"
+                session.status = "connected"
+                session.audio_capture_enabled = True
+                session.tts_playing = False
+                session.tts_tokens = set()
+                session.tts_active_count = 0
+                session.tool_runtime_generation = getattr(self, "_tool_generation", None)
+                self._resolve_session_tool_runtime(session)
+
+                bridge_id = await self.ari_client.create_bridge()
+                if not bridge_id:
+                    raise RuntimeError("Failed to create mixing bridge for agent handoff")
+                caller_success = await self.ari_client.add_channel_to_bridge(
+                    bridge_id, caller_channel_id
+                )
+                if not caller_success:
+                    raise RuntimeError("Failed to add caller to bridge for agent handoff")
+                session.bridge_id = bridge_id
+                self.bridges[caller_channel_id] = bridge_id
                 await self._save_session(session)
-                await self._handle_provider_start_failure(session)
-                return
 
-            ai_provider_value = None
-            try:
-                resp = await self.ari_client.send_command(
-                    "GET",
-                    f"channels/{caller_channel_id}/variable",
-                    params={"variable": "AI_PROVIDER"},
-                    tolerate_statuses=[404],
-                )
-                if isinstance(resp, dict):
-                    ai_provider_value = (resp.get("value") or "").strip() or None
-            except Exception:
-                ai_provider_value = None
+                try:
+                    await self._hydrate_transport_from_dialplan(session, caller_channel_id)
+                except Exception:
+                    logger.debug(
+                        "Transport hydration failed during agent handoff",
+                        call_id=caller_channel_id,
+                        exc_info=True,
+                    )
+                try:
+                    await self._detect_caller_codec(session, caller_channel_id)
+                except Exception:
+                    logger.debug(
+                        "Caller codec detection failed during agent handoff",
+                        call_id=caller_channel_id,
+                        exc_info=True,
+                    )
 
-            if ai_provider_value and ai_provider_value in self.providers:
-                self._assign_session_provider(session, ai_provider_value)
-                use_local = self._should_use_local_vad(ai_provider_value)
-                session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
-                await self._save_session(session)
-            elif ai_provider_value:
-                pipeline_resolution = await self._assign_pipeline_to_session(
-                    session, pipeline_name=ai_provider_value, strict=True
-                )
-                if pipeline_resolution:
-                    try:
-                        await self._ensure_pipeline_runner(session, forced=True)
-                    except Exception:
-                        logger.debug(
-                            "Failed to start pipeline runner during agent handoff",
-                            call_id=caller_channel_id,
-                            exc_info=True,
-                        )
-                else:
+                await self._resolve_audio_profile(session, caller_channel_id)
+                if getattr(session, "context_resolution_error", None):
                     session.agent_handoff_in_progress = False
                     await self._save_session(session)
-                    await self._handle_pipeline_resolution_failure(session)
+                    await self._handle_provider_start_failure(session)
                     return
-            else:
-                context_pipeline = None
-                if session.context_name:
-                    ctx_config = self.transport_orchestrator.get_context_config(
-                        session.context_name, getattr(session, "routing_method", None)
+
+                ai_provider_value = None
+                try:
+                    resp = await self.ari_client.send_command(
+                        "GET",
+                        f"channels/{caller_channel_id}/variable",
+                        params={"variable": "AI_PROVIDER"},
+                        tolerate_statuses=[404],
                     )
-                    if ctx_config and getattr(ctx_config, "pipeline", None):
-                        context_pipeline = ctx_config.pipeline
-                if context_pipeline:
+                    if isinstance(resp, dict):
+                        ai_provider_value = (resp.get("value") or "").strip() or None
+                except Exception:
+                    ai_provider_value = None
+
+                if ai_provider_value and ai_provider_value in self.providers:
+                    self._assign_session_provider(session, ai_provider_value)
+                    use_local = self._should_use_local_vad(ai_provider_value)
+                    session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
+                    await self._save_session(session)
+                elif ai_provider_value:
                     pipeline_resolution = await self._assign_pipeline_to_session(
-                        session, pipeline_name=context_pipeline, strict=True
+                        session, pipeline_name=ai_provider_value, strict=True
                     )
                     if pipeline_resolution:
                         try:
                             await self._ensure_pipeline_runner(session, forced=True)
                         except Exception:
                             logger.debug(
-                                "Failed to start context pipeline during agent handoff",
+                                "Failed to start pipeline runner during agent handoff",
                                 call_id=caller_channel_id,
                                 exc_info=True,
                             )
@@ -1768,71 +1842,101 @@ class Engine:
                         await self._save_session(session)
                         await self._handle_pipeline_resolution_failure(session)
                         return
-                elif session.provider_name and session.provider_name in self.providers:
-                    use_local = self._should_use_local_vad(session.provider_name)
-                    session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
-                    await self._save_session(session)
                 else:
-                    # Fall back to configured default provider for the new agent.
-                    default_provider = getattr(self.config, "default_provider", None)
-                    if default_provider:
-                        self._assign_session_provider(session, default_provider)
-                        use_local = self._should_use_local_vad(default_provider)
+                    context_pipeline = None
+                    if session.context_name:
+                        ctx_config = self.transport_orchestrator.get_context_config(
+                            session.context_name, getattr(session, "routing_method", None)
+                        )
+                        if ctx_config and getattr(ctx_config, "pipeline", None):
+                            context_pipeline = ctx_config.pipeline
+                    if context_pipeline:
+                        pipeline_resolution = await self._assign_pipeline_to_session(
+                            session, pipeline_name=context_pipeline, strict=True
+                        )
+                        if pipeline_resolution:
+                            try:
+                                await self._ensure_pipeline_runner(session, forced=True)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to start context pipeline during agent handoff",
+                                    call_id=caller_channel_id,
+                                    exc_info=True,
+                                )
+                        else:
+                            session.agent_handoff_in_progress = False
+                            await self._save_session(session)
+                            await self._handle_pipeline_resolution_failure(session)
+                            return
+                    elif session.provider_name and session.provider_name in self.providers:
+                        use_local = self._should_use_local_vad(session.provider_name)
                         session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
                         await self._save_session(session)
+                    else:
+                        # Fall back to configured default provider for the new agent.
+                        default_provider = getattr(self.config, "default_provider", None)
+                        if default_provider:
+                            self._assign_session_provider(session, default_provider)
+                            use_local = self._should_use_local_vad(default_provider)
+                            session.enhanced_vad_enabled = bool(self.vad_manager) and use_local
+                            await self._save_session(session)
 
-            logger.info(
-                "Agent handoff rebound",
-                call_id=caller_channel_id,
-                previous_agent=previous_agent,
-                new_agent=getattr(session, "context_name", None),
-                provider=getattr(session, "provider_name", None),
-                routing_method=getattr(session, "routing_method", None),
-            )
+                logger.info(
+                    "Agent handoff rebound",
+                    call_id=caller_channel_id,
+                    previous_agent=previous_agent,
+                    new_agent=getattr(session, "context_name", None),
+                    provider=getattr(session, "provider_name", None),
+                    routing_method=getattr(session, "routing_method", None),
+                )
 
-            if getattr(self, "call_media_lifecycle", None) is not None:
-                await self._setup_selected_call_media(session)
-            elif self.config.audio_transport == "externalmedia":
-                external_media_id = await self._start_external_media_channel(caller_channel_id)
-                if external_media_id and session.bridge_id:
-                    session.external_media_id = external_media_id
-                    await self._save_session(session)
-                    for _ in range(1, 26):
-                        if await self.ari_client.add_channel_to_bridge(
-                            session.bridge_id, external_media_id
-                        ):
+                if getattr(self, "call_media_lifecycle", None) is not None:
+                    await self._setup_selected_call_media(session)
+                elif self.config.audio_transport == "externalmedia":
+                    external_media_id = await self._start_external_media_channel(caller_channel_id)
+                    if external_media_id and session.bridge_id:
+                        session.external_media_id = external_media_id
+                        await self._save_session(session)
+                        for _ in range(1, 26):
+                            if await self.ari_client.add_channel_to_bridge(
+                                session.bridge_id, external_media_id
+                            ):
+                                if not session.provider_session_active:
+                                    await self._ensure_provider_session_started(caller_channel_id)
+                                break
+                            await asyncio.sleep(0.1)
+                elif self.config.audio_transport == "websocket":
+                    media_channel_id = await self._start_websocket_media_channel(session)
+                    if media_channel_id:
+                        for _ in range(1, 26):
+                            if await self._attach_websocket_media_channel(
+                                session, media_channel_id
+                            ):
+                                break
+                            await asyncio.sleep(0.1)
+                        if await self._await_websocket_media_ready(session):
                             if not session.provider_session_active:
                                 await self._ensure_provider_session_started(caller_channel_id)
-                            break
-                        await asyncio.sleep(0.1)
-            elif self.config.audio_transport == "websocket":
-                media_channel_id = await self._start_websocket_media_channel(session)
-                if media_channel_id:
-                    for _ in range(1, 26):
-                        if await self._attach_websocket_media_channel(
-                            session, media_channel_id
-                        ):
-                            break
-                        await asyncio.sleep(0.1)
-                    if await self._await_websocket_media_ready(session):
-                        if not session.provider_session_active:
-                            await self._ensure_provider_session_started(caller_channel_id)
-            else:
-                await self._originate_audiosocket_channel_hybrid(caller_channel_id)
+                else:
+                    await self._originate_audiosocket_channel_hybrid(caller_channel_id)
 
-            session.agent_handoff_in_progress = False
-            await self._save_session(session)
-        except Exception:
-            session.agent_handoff_in_progress = False
-            session.agent_handoff_pending = False
-            await self._save_session(session)
-            logger.error(
-                "Agent handoff re-entry failed",
-                call_id=caller_channel_id,
-                previous_agent=previous_agent,
-                exc_info=True,
-            )
-            await self._cleanup_call(caller_channel_id, force_caller_hangup=True)
+                session.agent_handoff_in_progress = False
+                await self._save_session(session)
+            except Exception:
+                session.agent_handoff_in_progress = False
+                session.agent_handoff_pending = False
+                await self._save_session(session)
+                logger.error(
+                    "Agent handoff re-entry failed",
+                    call_id=caller_channel_id,
+                    previous_agent=previous_agent,
+                    exc_info=True,
+                )
+                await self._cleanup_call(caller_channel_id, force_caller_hangup=True)
+            finally:
+                # Keep the lock map from growing across long-lived processes.
+                if not getattr(session, "agent_handoff_in_progress", False):
+                    self._release_transfer_hop_lock(caller_channel_id)
 
     async def _configure_no_input_watchdog(self, session: CallSession, context_config: Any = None) -> None:
         """Resolve global + per-agent inactivity policy and register it for the call."""

@@ -58,6 +58,7 @@ def _make_engine() -> Engine:
     engine._tool_generation = None
     engine._transfer_stasis_hop_tasks = {}
     engine._transfer_stasis_hop_timeout_sec = 5.0
+    engine._transfer_hop_locks = {}
     engine._seen_aux_channels = set()
     engine._outbound_awaiting_amd_channel_ids = set()
 
@@ -81,11 +82,13 @@ def _make_engine() -> Engine:
     engine._start_external_media_channel = AsyncMock(return_value="ext-media-1")
     engine._ensure_provider_session_started = AsyncMock()
     engine._cleanup_call = AsyncMock()
-    engine._suspend_call_resources_for_stasis_hop = AsyncMock(
-        side_effect=lambda session: Engine._suspend_call_resources_for_stasis_hop(
-            engine, session
+
+    async def _suspend(session, *, ownership_token=None):
+        return await Engine._suspend_call_resources_for_stasis_hop(
+            engine, session, ownership_token=ownership_token
         )
-    )
+
+    engine._suspend_call_resources_for_stasis_hop = AsyncMock(side_effect=_suspend)
     return engine
 
 
@@ -248,3 +251,92 @@ async def test_drop_channel_aliases_prevents_aux_lookup():
     await store.drop_channel_aliases(session, ["ext-1"])
     assert await store.get_by_channel_id("ext-1") is None
     assert await store.get_by_call_id("chan-1") is session
+
+
+@pytest.mark.asyncio
+async def test_late_hop_suspend_does_not_destroy_handoff_bridge():
+    """Regression: Motostore 1789733697.2 — hop suspend raced past handoff rebound.
+
+    StasisEnd hop awaited provider stop while StasisStart handoff built a new bridge
+    + AudioSocket. Hop then re-read session.bridge_id and destroyed the new bridge,
+    leaving media_rx_confirmed=False / Cannot play audio - no bridge ID.
+    """
+    engine = _make_engine()
+    engine._suspend_call_resources_for_stasis_hop = (
+        Engine._suspend_call_resources_for_stasis_hop.__get__(engine, Engine)
+    )
+
+    gate = asyncio.Event()
+    destroyed: list[str] = []
+
+    async def _slow_stop_provider(call_id, provider, provider_name=None):
+        await gate.wait()
+
+    async def _track_destroy(bridge_id):
+        destroyed.append(bridge_id)
+        return True
+
+    engine._stop_call_provider_instance = AsyncMock(side_effect=_slow_stop_provider)
+    engine.ari_client.destroy_bridge = AsyncMock(side_effect=_track_destroy)
+    engine._call_providers["chan-1"] = object()
+
+    session = CallSession(
+        call_id="chan-1",
+        caller_channel_id="chan-1",
+        provider_name="deepgram",
+        context_name="recepcionista_motostore",
+        transfer_active=True,
+        transfer_target="Ventas Motostore (ext 7102)",
+        bridge_id="bridge-old",
+        audiosocket_channel_id="audio-old",
+        provider_session_active=True,
+    )
+    await engine.session_store.upsert_call(session)
+
+    ownership = "bridge-old|audio-old"
+    suspend_task = asyncio.create_task(
+        Engine._suspend_call_resources_for_stasis_hop(
+            engine, session, ownership_token=ownership
+        )
+    )
+    # Let hop enter provider-stop await (same window as production race).
+    for _ in range(20):
+        if engine._stop_call_provider_instance.await_count:
+            break
+        await asyncio.sleep(0)
+    assert engine._stop_call_provider_instance.await_count == 1
+
+    # Handoff wins mid-flight: claim call and install new media identity.
+    session.agent_handoff_in_progress = True
+    session.bridge_id = "bridge-new"
+    session.audiosocket_channel_id = "audio-new"
+    await engine.session_store.upsert_call(session)
+
+    gate.set()
+    await suspend_task
+
+    assert "bridge-new" not in destroyed
+    assert session.bridge_id == "bridge-new"
+    assert session.audiosocket_channel_id == "audio-new"
+    engine.ari_client.hangup_channel.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stasis_end_hop_skipped_when_handoff_holds_lock():
+    """If handoff already claimed the call, a late StasisEnd hop must no-op."""
+    engine = _make_engine()
+    engine._suspend_call_resources_for_stasis_hop = AsyncMock()
+    session = CallSession(
+        call_id="chan-1",
+        caller_channel_id="chan-1",
+        provider_name="deepgram",
+        transfer_active=True,
+        agent_handoff_in_progress=True,
+        bridge_id="bridge-new",
+    )
+    await engine.session_store.upsert_call(session)
+
+    await Engine._begin_transfer_stasis_hop(engine, session, "chan-1")
+
+    engine._suspend_call_resources_for_stasis_hop.assert_not_awaited()
+    assert session.bridge_id == "bridge-new"
