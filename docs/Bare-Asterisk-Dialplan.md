@@ -46,16 +46,23 @@ extensions are enough.
 
 ## Deploy / update this fork on Debian
 
-From the AVA install directory (compose project `asterisk-ai-voice-agent`):
+**Run these from the git checkout**, not from `/root`. On Motostore AVA the tree is:
+
+`/usr/local/src/AVA-AI-Voice-Agent-for-Asterisk`
+
+(`agent check` shows mounts from that path). If you run `agent update` / `git` from `~`,
+you get `fatal: no es un repositorio git`.
 
 ```bash
+cd /usr/local/src/AVA-AI-Voice-Agent-for-Asterisk
+
 # Prefer the maintained updater when pointing at your fork/ref:
-agent update --ref <branch-or-tag> --include-ui --local-changes=retain
+agent update --ref cursor/voice-agent-ava-handoff-e987 --include-ui --local-changes=retain
 
 # Or pull the fork branch and recreate engine + UI:
 git fetch origin
-git checkout <branch>
-git pull --ff-only
+git checkout cursor/voice-agent-ava-handoff-e987
+git pull --ff-only origin cursor/voice-agent-ava-handoff-e987
 docker compose -p asterisk-ai-voice-agent up -d --build --force-recreate ai_engine admin_ui
 agent check
 ```
