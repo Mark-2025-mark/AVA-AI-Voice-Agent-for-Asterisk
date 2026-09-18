@@ -80,7 +80,7 @@ This document summarizes the utilities under `scripts/` and when to use them.
 - `scripts/update-recover.sh`
   - Host-side recovery for Admin UI update planner failures, stale updater images, mixed `.git`/`.agent` ownership, and local tracked source edits that need an explicit retain/overwrite/abort decision.
   - Captures diagnostics under `/var/tmp/aava-update-recovery-*`, tracked-change patches, conflicted-file copies when a previous merge is unresolved, and a best-effort config/data backup before update. The script may repair `.git` and Git-tracked path ownership before inspection; later ownership repair is bounded to `.agent`, and it does not recursively chown the whole checkout.
-  - Usage: `sudo bash scripts/update-recover.sh --repo /path/to/AVA-AI-Voice-Agent-for-Asterisk --ref v7.5.6 --include-ui`
+  - Usage: `sudo bash scripts/update-recover.sh --repo /path/to/AVA-AI-Voice-Agent-for-Asterisk --ref v7.6.0 --include-ui`
 
 ## Admin UI URL and Catalog Maintenance
 
@@ -128,6 +128,10 @@ update a single deduplicated tracking issue rather than creating duplicates.
     update `HF_REV` at the top of the script, regenerate, review, paste.
 
 ## Miscellaneous
+
+- `scripts/issue_625_metadata_guidance_trial.py`
+  - Temporary, version-guarded issue #625 trial that strengthens only the provider-facing `update_call_metadata` instructions. Supports `apply`, `check`, and `revert`; it does not change field permissions, persisted data, or configuration.
+  - Usage: `python3 scripts/issue_625_metadata_guidance_trial.py apply`, followed by an `ai_engine` rebuild/recreate. Use `revert` and rebuild/recreate to roll back.
 
 - `scripts/llm_latency_test.py`
   - Rough latency probe for LLM responses (dev utility).

@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import math
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -8,6 +10,93 @@ from fastapi import APIRouter, HTTPException, Query
 from api.log_events import LogEvent, parse_log_line, should_hide_payload
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_DOCKER_LOG_TIMEOUT_SECONDS = 10
+ALLOWED_LOG_CONTAINERS = {"ai_engine", "local_ai_server", "admin_ui"}
+_TRUSTED_COMPOSE_PROJECT = "asterisk-ai-voice-agent"
+
+
+def _sanitize_log_value(value: str) -> str:
+    """Remove line breaks so request values cannot forge additional log entries."""
+    return value.replace("\r\n", "").replace("\r", "").replace("\n", "")
+
+
+def _container_labels(container: Any) -> Dict[str, str]:
+    """Return normalized Docker labels without trusting filter semantics alone."""
+    labels = getattr(container, "labels", None)
+    if not isinstance(labels, dict):
+        attrs = getattr(container, "attrs", {}) or {}
+        labels = (attrs.get("Config", {}) or {}).get("Labels", {}) if isinstance(attrs, dict) else {}
+    return {str(key): str(value) for key, value in (labels or {}).items()}
+
+
+def _resolve_log_container(client: Any, container_name: str):
+    """Resolve only an exact approved name or one unambiguous trusted Compose service."""
+    try:
+        container = client.containers.get(container_name)
+    except docker.errors.NotFound:
+        container = None
+
+    if container is not None and str(getattr(container, "name", "")).lstrip("/") == container_name:
+        return container
+
+    project_label = f"com.docker.compose.project={_TRUSTED_COMPOSE_PROJECT}"
+    service_label = f"com.docker.compose.service={container_name}"
+    candidates = client.containers.list(
+        all=True,
+        filters={"label": [project_label, service_label]},
+    )
+    trusted = []
+    for candidate in candidates:
+        labels = _container_labels(candidate)
+        if (
+            labels.get("com.docker.compose.project") == _TRUSTED_COMPOSE_PROJECT
+            and labels.get("com.docker.compose.service") == container_name
+        ):
+            trusted.append(candidate)
+
+    if len(trusted) == 1:
+        return trusted[0]
+    if len(trusted) > 1:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Multiple trusted containers found for '{container_name}'",
+        )
+    raise HTTPException(status_code=404, detail=f"Container '{container_name}' not found")
+
+
+def _read_container_logs_sync(
+    container_name: str,
+    *,
+    tail: Optional[int],
+    since: Optional[int] = None,
+    until: Optional[int] = None,
+) -> Tuple[bytes, str, str]:
+    """Read Docker logs without blocking FastAPI's asyncio event loop."""
+    if container_name not in ALLOWED_LOG_CONTAINERS:
+        raise HTTPException(status_code=400, detail="Unsupported log container")
+    client = docker.from_env(timeout=_DOCKER_LOG_TIMEOUT_SECONDS)
+    try:
+        container = _resolve_log_container(client, container_name)
+
+        kwargs: Dict[str, Any] = {"tail": tail}
+        if since is not None:
+            kwargs["since"] = since
+        if until is not None:
+            kwargs["until"] = until
+        if since is not None or until is not None:
+            kwargs["timestamps"] = False
+
+        logs = container.logs(**kwargs) or b""
+        return logs, container.id, container.name
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Failed to close Docker client after log read", exc_info=True)
 
 
 def _parse_iso_to_epoch_seconds(value: Optional[str], *, round_up: bool = False) -> Optional[int]:
@@ -132,7 +221,12 @@ def _compute_related_ids(parsed: List[Tuple[LogEvent, Dict[str, str]]], seed_cal
                 ids_in_line.add(meta.get("external_media_id", ""))
             ids_in_line.discard("")
 
-            intersects = bool(ids_in_line & wanted_ids) or (event.call_id in wanted_ids if event.call_id else False)
+            bridge_id = (kv.get("bridge_id") or "").strip()
+            intersects = (
+                bool(ids_in_line & wanted_ids)
+                or (event.call_id in wanted_ids if event.call_id else False)
+                or bool(bridge_id and bridge_id in wanted_bridge_ids)
+            )
             if not intersects:
                 continue
 
@@ -141,7 +235,6 @@ def _compute_related_ids(parsed: List[Tuple[LogEvent, Dict[str, str]]], seed_cal
             if len(wanted_ids) != before:
                 changed = True
 
-            bridge_id = (kv.get("bridge_id") or "").strip()
             if bridge_id and bridge_id not in wanted_bridge_ids:
                 wanted_bridge_ids.add(bridge_id)
                 changed = True
@@ -160,29 +253,17 @@ async def get_container_logs(
     Fetch logs from a specific container.
     """
     try:
-        client = docker.from_env()
-        # Filter by name to find the correct container
-        # We use a loose match because docker compose prepends project name
-        containers = client.containers.list(all=True, filters={"name": container_name})
-        
-        if not containers:
-            # Try exact match if loose match fails or returns multiple (though list returns list)
-            try:
-                container = client.containers.get(container_name)
-                containers = [container]
-            except docker.errors.NotFound:
-                raise HTTPException(status_code=404, detail=f"Container '{container_name}' not found")
-
-        # Pick the first match (usually the most relevant one if unique enough)
-        container = containers[0]
-        
         wanted_levels = {v.strip().lower() for v in _split_csv(levels)} if levels else set()
         q_norm = (q or "").strip().lower() or None
 
-        # Get logs
-        logs = (container.logs(tail=tail) or b"").decode("utf-8", errors="replace")
+        logs_bytes, container_id, resolved_name = await asyncio.to_thread(
+            _read_container_logs_sync,
+            container_name,
+            tail=tail,
+        )
+        logs = logs_bytes.decode("utf-8", errors="replace")
         if not (wanted_levels or q_norm):
-            return {"logs": logs, "container_id": container.id, "name": container.name}
+            return {"logs": logs, "container_id": container_id, "name": resolved_name}
 
         out_lines: List[str] = []
         for line in logs.splitlines():
@@ -200,9 +281,16 @@ async def get_container_logs(
             # Preserve original ANSI formatting for the Raw Logs view.
             out_lines.append(line)
 
-        return {"logs": "\n".join(out_lines), "container_id": container.id, "name": container.name}
+        return {"logs": "\n".join(out_lines), "container_id": container_id, "name": resolved_name}
 
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.warning(
+            "Docker log read failed for %s",
+            _sanitize_log_value(container_name),
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -227,16 +315,6 @@ async def get_container_log_events(
     This is designed for the Admin UI "Events" view to enable fast troubleshooting.
     """
     try:
-        client = docker.from_env()
-        containers = client.containers.list(all=True, filters={"name": container_name})
-        if not containers:
-            try:
-                container = client.containers.get(container_name)
-                containers = [container]
-            except docker.errors.NotFound:
-                raise HTTPException(status_code=404, detail=f"Container '{container_name}' not found")
-        container = containers[0]
-
         q_norm = (q or "").strip().lower() or None
         call_id_norm = (call_id or "").strip() or None
 
@@ -248,13 +326,13 @@ async def get_container_log_events(
         window_source = "query" if (since_epoch or until_epoch) else "tail"
         call_meta: Optional[Dict[str, Any]] = None
 
-        # If user filtered by call_id but did not provide a time window, try to resolve
-        # the call's start/end from call history to avoid tail-based truncation.
-        if call_id_norm and since_epoch is None and until_epoch is None and not since_seconds_ago:
+        # Always resolve metadata for a selected call.  Use its padded window only
+        # when the caller did not supply an explicit range.
+        if call_id_norm:
             ch_since, ch_until, ch_meta = await _resolve_call_history_window(call_id_norm, pad_seconds=call_window_pad_seconds)
-            if ch_since is not None or ch_until is not None:
+            call_meta = ch_meta
+            if since_epoch is None and until_epoch is None and not since_seconds_ago and (ch_since is not None or ch_until is not None):
                 since_epoch, until_epoch = ch_since, ch_until
-                call_meta = ch_meta
                 window_source = "call_history"
 
         if since_epoch is None and since_seconds_ago and since_seconds_ago > 0:
@@ -262,11 +340,12 @@ async def get_container_log_events(
             window_source = "relative"
 
         # Keep volume bounded: use time-window when provided, otherwise tail.
-        logs_bytes = container.logs(
+        logs_bytes, container_id, resolved_name = await asyncio.to_thread(
+            _read_container_logs_sync,
+            container_name,
             since=since_epoch,
             until=until_epoch,
             tail=None if (since_epoch or until_epoch) else 2000,
-            timestamps=False,
         )
         logs_text = (logs_bytes or b"").decode("utf-8", errors="replace")
 
@@ -332,8 +411,8 @@ async def get_container_log_events(
 
         return {
             "events": [e.to_dict() for e in events_sorted],
-            "container_id": container.id,
-            "name": container.name,
+            "container_id": container_id,
+            "name": resolved_name,
             "call": call_meta,
             "window": {
                 "source": window_source,
@@ -347,4 +426,9 @@ async def get_container_log_events(
     except HTTPException:
         raise
     except Exception as e:
+        logger.warning(
+            "Docker log event read failed for %s",
+            _sanitize_log_value(container_name),
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=str(e))

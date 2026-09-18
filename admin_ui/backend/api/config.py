@@ -13,6 +13,8 @@ import tempfile
 import sys
 import threading
 import logging
+import math
+import json
 import ssl
 import smtplib
 from copy import deepcopy
@@ -272,34 +274,71 @@ def _admin_ui_env_key(key: str) -> bool:
     )
 
 
-def _assert_no_duplicate_yaml_keys(node: yaml.Node) -> None:
+class _RecursiveYamlAliasError(ConstructorError):
+    """Raised when YAML aliases create a cycle in the configuration graph."""
+
+
+class _NonFiniteYamlKeyError(ConstructorError):
+    """Raised when a YAML mapping uses a non-JSON-compatible numeric key."""
+
+
+def _assert_no_duplicate_yaml_keys(
+    node: yaml.Node,
+    visiting: Optional[set[int]] = None,
+) -> None:
     """
     Detect duplicate mapping keys before calling yaml.safe_load().
 
     We avoid yaml.load() here to keep CodeQL happy while still enforcing our
     "no duplicate keys" constraint for Admin UI config edits.
     """
-    if isinstance(node, MappingNode):
-        seen: dict[str, ScalarNode] = {}
-        for key_node, value_node in node.value:
-            # Config files use string keys; if not, fall back to a stable repr.
-            if isinstance(key_node, ScalarNode):
-                key = str(key_node.value)
-            else:
-                key = str(key_node)
-            if key in seen:
-                raise ConstructorError(
-                    "while constructing a mapping",
-                    node.start_mark,
-                    f"found duplicate key ({key!r})",
-                    key_node.start_mark,
-                )
-            if isinstance(key_node, ScalarNode):
-                seen[key] = key_node
-            _assert_no_duplicate_yaml_keys(value_node)
-    elif isinstance(node, SequenceNode):
-        for item in node.value:
-            _assert_no_duplicate_yaml_keys(item)
+    if not isinstance(node, (MappingNode, SequenceNode)):
+        return
+
+    active = visiting if visiting is not None else set()
+    node_id = id(node)
+    if node_id in active:
+        raise _RecursiveYamlAliasError(
+            "while constructing the configuration",
+            node.start_mark,
+            "found recursive YAML alias",
+            node.start_mark,
+        )
+
+    active.add(node_id)
+    try:
+        if isinstance(node, MappingNode):
+            seen: dict[str, ScalarNode] = {}
+            for key_node, value_node in node.value:
+                # Config files use string keys; if not, fall back to a stable repr.
+                if isinstance(key_node, ScalarNode):
+                    if key_node.tag == "tag:yaml.org,2002:float":
+                        parsed_key = yaml.safe_load(key_node.value)
+                        if isinstance(parsed_key, float) and not math.isfinite(parsed_key):
+                            raise _NonFiniteYamlKeyError(
+                                "while constructing a mapping",
+                                node.start_mark,
+                                f"found non-finite numeric key ({key_node.value!r})",
+                                key_node.start_mark,
+                            )
+                    key = str(key_node.value)
+                else:
+                    key = str(key_node)
+                if key in seen:
+                    raise ConstructorError(
+                        "while constructing a mapping",
+                        node.start_mark,
+                        f"found duplicate key ({key!r})",
+                        key_node.start_mark,
+                    )
+                if isinstance(key_node, ScalarNode):
+                    seen[key] = key_node
+                _assert_no_duplicate_yaml_keys(value_node, active)
+        else:
+            for item in node.value:
+                _assert_no_duplicate_yaml_keys(item, active)
+    finally:
+        active.remove(node_id)
 
 
 def _safe_load_no_duplicates(content: str):
@@ -307,6 +346,75 @@ def _safe_load_no_duplicates(content: str):
     if node is not None:
         _assert_no_duplicate_yaml_keys(node)
     return yaml.safe_load(content)
+
+
+class _RecursiveConfigAliasError(ValueError):
+    """Raised when an in-memory configuration contains a recursive container."""
+
+    def __init__(self, path: str):
+        self.path = path or "<root>"
+        super().__init__(self.path)
+
+
+def _non_finite_number_paths(
+    value: Any,
+    path: str = "",
+    visiting: Optional[set[int]] = None,
+) -> list[str]:
+    """Return config paths containing floats that cannot be represented in JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return [path or "<root>"]
+
+    if not isinstance(value, (dict, list)):
+        return []
+
+    active = visiting if visiting is not None else set()
+    value_id = id(value)
+    if value_id in active:
+        raise _RecursiveConfigAliasError(path)
+
+    active.add(value_id)
+    paths: list[str] = []
+    try:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                key_text = str(key)
+                if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", key_text):
+                    child_path = f"{path}.{key_text}" if path else key_text
+                else:
+                    child_path = f"{path}[{json.dumps(key_text)}]"
+                paths.extend(_non_finite_number_paths(child, child_path, active))
+        else:
+            for index, child in enumerate(value):
+                paths.extend(_non_finite_number_paths(child, f"{path}[{index}]", active))
+        return paths
+    finally:
+        active.remove(value_id)
+
+
+def _assert_finite_config_numbers(value: Any, *, status_code: int = 400) -> None:
+    try:
+        paths = _non_finite_number_paths(value)
+    except _RecursiveConfigAliasError as exc:
+        raise HTTPException(
+            status_code=status_code,
+            detail=(
+                "Configuration contains a recursive YAML alias at "
+                f"{exc.path}. Replace the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    if not paths:
+        return
+    displayed = ", ".join(paths[:10])
+    if len(paths) > 10:
+        displayed += f", and {len(paths) - 10} more"
+    raise HTTPException(
+        status_code=status_code,
+        detail=(
+            "Configuration contains non-finite numeric values that are not JSON-compatible: "
+            f"{displayed}. Replace .nan/.inf values in Advanced > Raw YAML with finite numbers."
+        ),
+    )
 
 
 def _deep_merge_dicts(base: dict, override: dict) -> dict:
@@ -394,6 +502,8 @@ def _read_merged_config_dict() -> dict:
     try:
         with open(settings.LOCAL_CONFIG_PATH, "r") as f:
             local = _safe_load_no_duplicates(f.read()) or {}
+    except (_RecursiveYamlAliasError, _NonFiniteYamlKeyError):
+        raise
     except Exception:
         return base
 
@@ -776,6 +886,11 @@ def _validate_ai_agent_config(content: str) -> Dict[str, Any]:
 
     if not isinstance(parsed, dict):
         raise HTTPException(status_code=400, detail="Invalid YAML: expected a mapping at the document root")
+
+    # YAML permits .nan/.inf, but JSON and downstream numeric operations do not.
+    # Reject these values before validation or persistence so a form edit cannot
+    # poison the structured config endpoint or runtime behavior.
+    _assert_finite_config_numbers(parsed)
 
     # Ensure project root is importable so we can reuse canonical Pydantic models.
     project_root = getattr(settings, "PROJECT_ROOT", None)
@@ -1199,7 +1314,77 @@ async def reset_pipeline_audio(pipeline_name: str):
 @router.get("")
 @router.get("/")
 async def get_config():
-    return _read_merged_config_dict()
+    try:
+        safe = _redact_websocket_media_secrets(_read_merged_config_dict())
+    except _RecursiveYamlAliasError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a recursive YAML alias. Repair the local "
+                "configuration file by replacing the alias with an ordinary mapping or list."
+            ),
+        ) from exc
+    except _NonFiniteYamlKeyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Configuration contains a non-finite numeric mapping key. Repair the local "
+                "configuration file by replacing .nan/.inf keys with ordinary text keys."
+            ),
+        ) from exc
+    # Existing operator overrides may predate write-time validation. Return a
+    # controlled, actionable response while leaving /yaml available for repair.
+    _assert_finite_config_numbers(safe, status_code=422)
+    return safe
+
+
+def _redact_websocket_media_secrets(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Defensively keep an accidentally hand-written WS secret out of API reads."""
+    safe = deepcopy(config)
+    websocket_media = safe.get("websocket_media") if isinstance(safe, dict) else None
+    auth = websocket_media.get("auth") if isinstance(websocket_media, dict) else None
+    if isinstance(auth, dict):
+        # `password_env` is an identifier, not a credential, and remains visible
+        # so operators know exactly which ai_engine env var is required.
+        for key in ("password", "secret", "token"):
+            auth.pop(key, None)
+    return safe
+
+
+@router.get("/websocket-media-status")
+async def get_websocket_media_status():
+    """Return safe WebSocket listener configuration and env-file secret state.
+
+    The Admin UI does not infer secret availability from its own container
+    environment.  ai_engine receives the project `.env` through Compose's
+    `env_file`, so this endpoint checks that intended source only and never
+    returns its value.
+    """
+    try:
+        from dotenv import dotenv_values
+        from src.config import WebSocketMediaConfig
+
+        merged = _read_merged_config_dict()
+        raw = merged.get("websocket_media") if isinstance(merged, dict) else None
+        websocket_media = WebSocketMediaConfig.model_validate(raw or {})
+        password_env = websocket_media.auth.password_env
+        dotenv_map = dotenv_values(settings.ENV_PATH) if os.path.exists(settings.ENV_PATH) else {}
+        secret_present = bool(str(dotenv_map.get(password_env) or "").strip())
+        return {
+            "config": websocket_media.model_dump(),
+            "secret_reference": password_env,
+            "secret_present": secret_present,
+            "secret_source": "ai_engine env_file (.env)",
+        }
+    except Exception as exc:
+        # Validation errors can include rejected raw input values (including an
+        # accidentally hand-written auth.password), so never attach traceback
+        # data to this operator-facing status failure.
+        logger.warning("Unable to read WebSocket media status")
+        raise HTTPException(
+            status_code=400,
+            detail="WebSocket media configuration is invalid; correct it in Audio Transport settings.",
+        ) from exc
 
 
 @router.post("/yaml")
@@ -1225,8 +1410,13 @@ async def get_yaml_config():
         # Return the merged config (base + local overrides) so the editor
         # always shows the effective configuration the engine will use.
         config_content = _read_merged_config_content()
-        _safe_load_no_duplicates(config_content)  # Validate YAML and reject duplicate keys
-        return {"content": config_content}
+        parsed = _safe_load_no_duplicates(config_content)  # Validate YAML and reject duplicate keys
+        safe_content = yaml.dump(
+            _redact_websocket_media_secrets(parsed or {}),
+            default_flow_style=False,
+            sort_keys=False,
+        )
+        return {"content": safe_content}
     except yaml.YAMLError as e:
         logger.info("YAML parse error while reading config YAML", exc_info=True)
         # Extract detailed error information for user-friendly display
@@ -1486,6 +1676,16 @@ async def update_env(env_data: Dict[str, Optional[str]]):
         changed_keys = sorted(set(keys_to_update) | set(keys_to_delete))
 
         impacts_ai_engine = any(_ai_engine_env_key(k) for k in changed_keys)
+        # A WebSocket credential may use an operator-selected env name rather
+        # than the default ASTERISK_* prefix. Its value still enters ai_engine
+        # through env_file and requires recreation, including on deletion.
+        try:
+            effective = _read_merged_config_dict()
+            ws_auth = ((effective.get("websocket_media") or {}).get("auth") or {})
+            ws_password_env = str(ws_auth.get("password_env") or "ASTERISK_MEDIA_WS_PASSWORD")
+            impacts_ai_engine = impacts_ai_engine or ws_password_env in changed_keys
+        except Exception:
+            logger.warning("Unable to resolve custom media credential reference for environment apply plan")
         impacts_local_ai = any(_local_ai_env_key(k) for k in changed_keys)
         impacts_admin_ui = any(_admin_ui_env_key(k) for k in changed_keys)
 
@@ -2292,143 +2492,14 @@ async def test_smtp_settings(req: SmtpTestRequest):
 
 @router.get("/export-logs")
 async def export_logs():
-    """Export logs and sanitized configuration for troubleshooting"""
-    try:
-        import zipfile
-        import io
-        import glob
-        from datetime import datetime
-        import subprocess
-        
-        # Create ZIP in memory
-        zip_buffer = io.BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # 1. Sanitized YAML (merged base + local override)
-            try:
-                import yaml
-                parsed = _read_merged_config_dict()
+    """Deprecated compatibility export: bounded, sanitized system diagnostics."""
+    from api.support import SystemBundleRequest, _system_bundle_sync
 
-                import re
-                email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-                # Pattern for hostnames that look like internal infrastructure
-                hostname_pattern = re.compile(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', re.IGNORECASE)
-                
-                def redact(obj):
-                    if isinstance(obj, dict):
-                        out = {}
-                        for k, v in obj.items():
-                            key = str(k).lower()
-                            # Redact sensitive keys
-                            if any(s in key for s in ["api_key", "apikey", "token", "secret", "password", "pass", "key"]):
-                                out[k] = "[REDACTED]"
-                            # Redact email fields
-                            elif "email" in key:
-                                out[k] = "[EMAIL_REDACTED]"
-                            else:
-                                out[k] = redact(v)
-                        return out
-                    if isinstance(obj, list):
-                        return [redact(v) for v in obj]
-                    # Redact email addresses and sensitive hostnames in string values
-                    if isinstance(obj, str):
-                        result = email_pattern.sub('[EMAIL_REDACTED]', obj)
-                        result = hostname_pattern.sub('[HOSTNAME_REDACTED]', result)
-                        return result
-                    return obj
-
-                if parsed:
-                    redacted = redact(parsed)
-                    zip_file.writestr(
-                        'ai-agent-sanitized.yaml',
-                        yaml.safe_dump(redacted, sort_keys=False, default_flow_style=False),
-                    )
-            except Exception:
-                # Fallback: write raw base if sanitization fails
-                if os.path.exists(settings.CONFIG_PATH):
-                    with open(settings.CONFIG_PATH, 'r') as f:
-                        zip_file.writestr('ai-agent-sanitized.yaml', f.read())
-            
-            # 2. Sanitized ENV (Just keys, no values)
-            if os.path.exists(settings.ENV_PATH):
-                env_keys = []
-                with open(settings.ENV_PATH, 'r') as f:
-                    for line in f:
-                        if '=' in line and not line.startswith('#'):
-                            key = line.split('=')[0].strip()
-                            env_keys.append(f"{key}=[REDACTED]")
-                zip_file.writestr('.env.sanitized', '\n'.join(env_keys))
-
-            # 2b. Host OS info (if mounted) and basic Docker versions
-            for os_release in ("/host/etc/os-release", "/etc/os-release"):
-                if os.path.exists(os_release):
-                    try:
-                        with open(os_release, "r") as f:
-                            zip_file.writestr("os-release.txt", f.read())
-                        break
-                    except Exception:
-                        pass
-
-            def add_cmd(name: str, cmd: list):
-                try:
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                    content = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-                    zip_file.writestr(name, content.strip() + "\n")
-                except Exception as e:
-                    zip_file.writestr(name, f"Failed to run {cmd}: {e}\n")
-
-            add_cmd("docker-version.txt", ["docker", "version"])
-            add_cmd("docker-compose-version.txt", ["docker", "compose", "version"])
-            add_cmd("docker-ps.txt", ["docker", "ps", "-a"])
-            
-            # 3. Logs from Docker Containers
-            try:
-                import docker
-                client = docker.from_env()
-                containers_to_log = ['ai_engine', 'local_ai_server', 'admin_ui']
-                
-                found_logs = False
-                for container_name in containers_to_log:
-                    try:
-                        container = client.containers.get(container_name)
-                        # Capture full logs (no tail limit)
-                        logs = container.logs().decode('utf-8', errors='replace')
-                        if logs:
-                            # Strip ANSI escape codes for clean log files
-                            clean_logs = strip_ansi_codes(logs)
-                            # Redact sensitive information for privacy (AAVA-162)
-                            import re
-                            # Email addresses
-                            clean_logs = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[EMAIL_REDACTED]', clean_logs)
-                            # PBX/SIP/VoIP hostnames (likely internal infrastructure)
-                            clean_logs = re.sub(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', '[HOSTNAME_REDACTED]', clean_logs, flags=re.IGNORECASE)
-                            # API key previews (e.g., api_key_preview=AIzaSyB2..._H_M)
-                            clean_logs = re.sub(r'(api_key_preview=)[^\s\]]+', r'\1[REDACTED]', clean_logs)
-                            zip_file.writestr(f'{container_name}.log', clean_logs)
-                            found_logs = True
-                    except Exception as e:
-                        zip_file.writestr(f'{container_name}_error.txt', f"Could not fetch logs: {str(e)}")
-                
-                if not found_logs:
-                    zip_file.writestr('logs_info.txt', 'No logs retrieved from containers.')
-
-            except Exception as e:
-                 zip_file.writestr('docker_error.txt', f"Failed to connect to Docker API: {str(e)}")
-
-            # Add timestamp
-            timestamp = datetime.now().isoformat()
-            zip_file.writestr('export_info.txt', f'Debug export created: {timestamp}\n')
-        
-        zip_buffer.seek(0)
-        
-        from fastapi.responses import StreamingResponse
-        return StreamingResponse(
-            zip_buffer, 
-            media_type="application/zip",
-            headers={"Content-Disposition": f"attachment; filename=debug-logs-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"}
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return await asyncio.to_thread(
+        _system_bundle_sync,
+        SystemBundleRequest(),
+        deprecated=True,
+    )
 
 @router.post("/import")
 async def import_configuration(file: UploadFile = File(...)):

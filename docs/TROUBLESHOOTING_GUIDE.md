@@ -184,6 +184,39 @@ Notes:
   - `LOCAL_WS_HOST=0.0.0.0`
   - `LOCAL_WS_AUTH_TOKEN=...` (required; server refuses to start if exposed without auth)
 
+### Export a Support Package for One Call
+
+For a problem tied to a specific call, use the Admin UI before collecting broad
+system logs:
+
+1. Open **Call History**, select the affected call, and click **Troubleshoot**.
+2. Review the diagnostic summary, lifecycle coverage, effective settings, tool
+   counts, and technical evidence.
+3. Leave the optional sources selected unless the page says they are probably
+   not needed, then click **Download Support Package**.
+4. Attach the ZIP to the GitHub issue or share it with support on Discord.
+
+The call package contains only evidence correlated to that call: AI Engine
+lifecycle logs, selected Local AI Server/Admin UI entries that reference the
+call ID, sanitized conversation text, pre-call/in-call/post-call tool execution
+details, basic system information, and the call-time provider, pipeline, Audio
+Profile, transport, codec, VAD, barge-in, and streaming settings. It never
+contains a recording, caller name, phone number, API key, password, prompt, or
+secret value.
+
+New calls keep an immutable settings snapshot. Older calls remain exportable,
+but the package notes when that snapshot was not captured. Console and JSON log
+formats are both supported, including mixed retained logs. DEBUG is not
+required: the snapshot and lifecycle header are captured independently at INFO;
+the package manifest reports the log formats and levels that were actually
+available.
+
+Use **System Logs → Export → System diagnostics** only when an issue is not tied
+to one call. That advanced package is time-bounded and sanitized, but it may
+contain operational events from multiple calls. **Download current view** saves
+only the raw lines visible after the current container, level, and search
+filters.
+
 ### Bounded Diagnostic Audio Capture
 
 Diagnostic WAVs can contain caller audio, agent audio, names, phone numbers, or
@@ -326,6 +359,9 @@ external_media:
   rtp_port: 18080
   # Optional: allocate per-call RTP ports
   # port_range: "18080:18099"
+
+# Opt-in, version-gated Asterisk Media WebSocket — see docs/WebSocket-Transport.md
+# audio_transport: websocket
 ```
 
 #### Dialplan Not Passing to Stasis
@@ -1589,8 +1625,9 @@ exten => s,1,NoOp(AI Voice Agent)
 **Transport is controlled in config, not dialplan:**
 - Set `audio_transport: externalmedia` for **pipelines** (hybrid, local_only)
 - Set `audio_transport: audiosocket` for **full agents** (Deepgram, OpenAI Realtime)
+- Set `audio_transport: websocket` only for the opt-in, version-gated Asterisk Media WebSocket transport — see [WebSocket-Transport.md](WebSocket-Transport.md)
 
-The `ai_engine` service automatically creates the AudioSocket server or RTP endpoint based on your config. You don't need to add `AudioSocket()` to the dialplan.
+The `ai_engine` service automatically creates the AudioSocket server, RTP endpoint, or WebSocket listener based on your config. You don't need to add `AudioSocket()` to the dialplan.
 
 **Agent Selection:**
 Use `AI_AGENT` to select an operator-managed agent. Normally its configured target is authoritative; set `AI_PROVIDER` only for an intentional per-call provider or pipeline override. Generate a current snippet with `agent dialplan --agent <slug>`.
