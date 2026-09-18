@@ -760,6 +760,10 @@ class UnifiedTransferTool(Tool):
             transfer_active=True,
             transfer_state=transfer_state,
             transfer_target=description,
+            # Persist the human-readable destination for Call History / support
+            # bundles. transfer_occurred is derived from transfer_destination;
+            # without it, successful handoffs look like transfer_occurred=false.
+            transfer_destination=description,
         )
 
         try:

@@ -9816,7 +9816,10 @@ class Engine:
                 voice_source=getattr(session, 'voice_source', None),
                 conversation_history=session.conversation_history or [],
                 outcome=outcome,
-                transfer_destination=session.transfer_destination,
+                transfer_destination=(
+                    getattr(session, "transfer_destination", None)
+                    or getattr(session, "transfer_target", None)
+                ),
                 error_message=session.error_message,
                 tool_calls=getattr(session, 'tool_calls', []) or [],
                 pre_call_tool_calls=getattr(session, 'pre_call_tool_calls', []) or [],
